@@ -10,11 +10,13 @@ const implementation = (() => {
   const ui = rainRuntime.api.ui;
   const { findByProps, findByStoreName } = metro;
   const { React, ReactNative: RN, FluxDispatcher } = metro.common;
+  const ReactionContext = React.createContext(null);
+  const reactionRenderers = new WeakMap();
 
-  const BUILD = "v1.0.3";
+  const BUILD = "v1.0.4";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
-  const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton|MessageReactions)$/;
+  const NAME_HINT = /^EmojiReactionRowButton$/;
   const SIZES = { small: 14, medium: 18, large: 22 };
 
   const unpatches = [];
@@ -252,6 +254,7 @@ const implementation = (() => {
   /* ---- reactors: fetch + cache ---- */
   function emojiParam(emoji) {
     if (!emoji) return null;
+    if (typeof emoji === "string") return emoji;
     if (emoji.id) return (emoji.name || "_") + ":" + emoji.id;
     return emoji.name || null;
   }
@@ -328,25 +331,104 @@ const implementation = (() => {
     try { const t = findByStoreName("ThemeStore"); light = !!t && t.theme === "light"; } catch (_) {}
     return light ? "#FFFFFF" : "#313338";
   }
+  function looksLikeMessage(value) {
+    return !!value && typeof value === "object" && value.id != null &&
+      ("channel_id" in value || "channelId" in value || "reactions" in value || "content" in value || "author" in value);
+  }
+  function messageContextFrom(args, rootProps, thisValue) {
+    const seen = new Set();
+    let messageId = null;
+    let channelId = null;
+    function visit(node, depth) {
+      if (!node || typeof node !== "object" || depth > 4 || seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        for (const item of node.slice(0, 8)) visit(item, depth + 1);
+        return;
+      }
+      const nestedMessage = node.message || (node.item && node.item.message) || null;
+      const candidates = [nestedMessage, node.item, node];
+      for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const id = candidate.messageId || candidate.message_id || (looksLikeMessage(candidate) ? candidate.id : null);
+        if (!messageId && id != null) messageId = String(id);
+        const channel = candidate.channelId || candidate.channel_id || (candidate.channel && candidate.channel.id) ||
+          (candidate.message && (candidate.message.channel_id || candidate.message.channelId)) || null;
+        if (!channelId && channel != null) channelId = String(channel);
+      }
+      if (depth < 4) {
+        for (const key of ["message", "item", "data", "props", "record", "messageRecord"]) {
+          if (node[key] && typeof node[key] === "object") visit(node[key], depth + 1);
+        }
+      }
+    }
+    visit(args, 0);
+    visit(thisValue, 0);
+    visit(rootProps, 0);
+    if (!channelId && rootProps) {
+      channelId = rootProps.channelId || rootProps.channel_id || (rootProps.channel && rootProps.channel.id) || null;
+    }
+    if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
+    if (!messageId) return null;
+    return { messageId: String(messageId), channelId: channelId == null ? null : String(channelId) };
+  }
+  function wrapReactionRenderer(original, rootProps) {
+    if (typeof original !== "function") return original;
+    if (original.__showReactionPFPWrapped) {
+      original.__showReactionPFPRootProps = rootProps;
+      return original;
+    }
+    let wrapped = reactionRenderers.get(original);
+    if (!wrapped) {
+      wrapped = function () {
+        const args = Array.prototype.slice.call(arguments);
+        const context = messageContextFrom(args, wrapped.__showReactionPFPRootProps, this);
+        const result = original.apply(this, args);
+        if (!context || !context.messageId || !context.channelId) {
+          if (cfg().debug && !debugSeen.has("REACTION renderer context missing")) {
+            recordDebug("REACTION renderer context missing; inspect renderReactions arguments");
+          }
+          return result;
+        }
+        if (cfg().debug && !debugSeen.has("REACTION renderer context captured")) {
+          recordDebug("REACTION renderer context captured: message and channel available");
+        }
+        return result == null ? result : React.createElement(ReactionContext.Provider, { value: context }, result);
+      };
+      wrapped.__showReactionPFPWrapped = true;
+      reactionRenderers.set(original, wrapped);
+    }
+    wrapped.__showReactionPFPRootProps = rootProps;
+    return wrapped;
+  }
   function Reactors(p) {
     const h = React.createElement;
-    const key = keyOf(p.channelId, p.messageId, p.emoji);
+    const inherited = React.useContext(ReactionContext);
+    let channelId = p.channelId || (inherited && inherited.channelId) || null;
+    const messageId = p.messageId || (inherited && inherited.messageId) || null;
+    if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
+    const key = channelId && messageId ? keyOf(channelId, messageId, p.emoji) : null;
     const [ver, bump] = React.useState(0);
     React.useEffect(() => {
+      if (!key) return undefined;
       const fn = () => bump((x) => x + 1);
       return subscribe(key, fn);
     }, [key]);
-    React.useEffect(() => { ensure(p.channelId, p.messageId, p.emoji, p.count); }, [key, p.count, ver]);
+    React.useEffect(() => {
+      if (!key) return undefined;
+      ensure(String(channelId), String(messageId), p.emoji, p.count);
+      return undefined;
+    }, [key, p.count, ver]);
     const s = cfg();
-    const entry = cache.get(key);
+    const entry = key ? cache.get(key) : null;
     const me = myId();
     const max = Math.max(1, Math.min(3, Number(s.maxAvatars) || 3));
     const users = ((entry && entry.users) || []).filter((u) => !(s.hideSelf && me && u.id === me)).slice(0, max);
-    if (!users.length) return p.original;
+    if (!key || !users.length) return p.original;
     const size = SIZES[s.size] || SIZES.medium;
     const ring = ringColor();
     const step = s.overlap ? -Math.round(size * 0.32) : 3;
-    return h(React.Fragment, null,
+    return h(RN.View, { pointerEvents: "box-none", style: { flexDirection: "row", alignItems: "center", alignSelf: "flex-start" } },
       p.original,
       h(RN.View, { pointerEvents: "none", style: { flexDirection: "row", alignItems: "center", marginLeft: 5 } },
         ...users.map((u, i) => h(RN.Image, { key: "rp-" + u.id, source: { uri: avatarUrl(u, 64) }, accessibilityLabel: u.name,
@@ -361,53 +443,28 @@ const implementation = (() => {
     if (!props) return null;
     const name = typeName(type);
     const candidate = /reaction|emoji/i.test(name) || !!(props.reaction || props.emoji || props.reactions);
-    if (/^MessageReactionsContent$/i.test(name) || /reactionemoji|reactioncount/i.test(name)) {
-      if (cfg().debug && candidate) recordDebug("SKIP " + name + ": container/child component");
+    if (!NAME_HINT.test(name)) {
+      if (cfg().debug && /^MessageReactions(Content)?$/i.test(name) && candidate) recordDebug("SKIP " + name + ": long-press reaction details UI");
       return null;
     }
-    const msg = props.message || null;
-    const reaction = props.reaction || (props.item && (props.item.reaction || props.item)) || null;
-    const emoji = props.emoji || (reaction && reaction.emoji) || null;
+    const msg = props.message || (props.item && props.item.message) || null;
+    const reaction = props.reaction || props.reactionData || (props.item && (props.item.reaction || props.item)) || null;
+    const emoji = props.emoji || props.reactionEmoji || (reaction && reaction.emoji) || (props.item && props.item.emoji) || null;
+    if (!emoji) {
+      if (cfg().debug) recordDebug("UNRESOLVED EmojiReactionRowButton: emoji missing; props=" + Object.keys(props).slice(0, 18).join(","));
+      return null;
+    }
     const messageId = props.messageId || (msg && msg.id) || props.message_id || null;
-    if (!emoji || !messageId) {
-      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + (name || "component") + ": emoji=" + !!emoji + ", messageId=" + !!messageId + ", keys=" + Object.keys(props).slice(0, 16).join(","));
-      return null;
-    }
-    if (!NAME_HINT.test(name) && !reaction) {
-      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + name + ": component name/props did not match per-reaction row");
-      return null;
-    }
     let channelId = props.channelId || (msg && (msg.channel_id || msg.channelId)) || props.channel_id || null;
     if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
-    if (!channelId) {
-      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + name + ": channelId missing");
-      return null;
-    }
-    const count = props.count != null ? props.count : (reaction && reaction.count != null ? reaction.count : 0);
-    if (cfg().debug) recordDebug("MATCHED " + name + ": message, channel and emoji found");
-    return { channelId: String(channelId), messageId: String(messageId), emoji, count };
-  }
-  function scheduleReactionPrefetch(props) {
-    if (!props || !Array.isArray(props.reactions) || !props.reactions.length || !props.messageId) return;
-    let channelId = props.channelId || props.channel_id || null;
-    if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
-    if (!channelId) return;
-    const messageId = String(props.messageId);
-    const pending = props.reactions.map((reaction) => ({
-      emoji: reaction && (reaction.emoji || (reaction.reaction && reaction.reaction.emoji)),
-      count: reaction && reaction.count != null ? reaction.count : 0
-    })).filter((reaction) => reaction.emoji && reaction.count > 0);
-    if (!pending.length) return;
-    if (cfg().debug) recordDebug("PREFETCH MessageReactionsContent: " + pending.length + " reactions");
-    Promise.resolve().then(() => {
-      if (!loadRequested || !cfg().enabled) return;
-      for (const reaction of pending) ensure(String(channelId), messageId, reaction.emoji, reaction.count);
-    });
+    const item = props.item || null;
+    const count = props.count != null ? props.count : (reaction && reaction.count != null ? reaction.count : (item && item.count != null ? item.count : 0));
+    if (cfg().debug) recordDebug("TARGET EmojiReactionRowButton: emoji found, message context " + (messageId ? "on row" : "from renderReactions") + ", channel " + (channelId ? "found" : "pending"));
+    return { channelId: channelId == null ? null : String(channelId), messageId: messageId == null ? null : String(messageId), emoji, count };
   }
   function patchReactions() {
     let runtime = null;
     try { const r = findByProps("jsx", "jsxs"); if (r && typeof r.jsx === "function") runtime = r; } catch (_) {}
-    if (!runtime) return false;
     const wrap = (args, ret) => {
       try {
         if (!ret || ret.type === Reactors) return ret;
@@ -415,11 +472,19 @@ const implementation = (() => {
         if (!st.enabled) return ret;
         const type = args && args[0];
         const props = ret.props || (args && args[1]) || null;
+        const name = typeName(type);
+        const hasReactionRenderer = !!(props && typeof props.renderReactions === "function");
+        if (!st.debug && !NAME_HINT.test(name) && !hasReactionRenderer) return ret;
         if (st.debug) {
           if (!debugSeen.has("JSX hook active")) recordDebug("JSX hook active; rendering intercepted elements");
           captureComponent(type, props);
         }
-        if (/^MessageReactionsContent$/i.test(typeName(type))) { scheduleReactionPrefetch(props); return ret; }
+        if (hasReactionRenderer) {
+          const renderer = wrapReactionRenderer(props.renderReactions, props);
+          if (renderer !== props.renderReactions && typeof React.cloneElement === "function") {
+            return React.cloneElement(ret, { renderReactions: renderer });
+          }
+        }
         const r = resolve(type, props);
         if (!r) return ret;
         const next = { original: ret, channelId: r.channelId, messageId: r.messageId, emoji: r.emoji, count: r.count };
@@ -428,12 +493,29 @@ const implementation = (() => {
       } catch (_) {}
       return ret;
     };
-    unpatches.push(patcher.after("jsx", runtime, wrap));
-    if (typeof runtime.jsxs === "function") unpatches.push(patcher.after("jsxs", runtime, wrap));
-    recordDebug("JSX hook installed" + (typeof runtime.jsxs === "function" ? " (jsx + jsxs)" : " (jsx only)") + "; open a chat with reactions to capture components");
+    const createElementWrap = (args, ret) => {
+      try {
+        if (!ret || ret.type === Reactors) return ret;
+        const state = cfg();
+        if (!state.enabled) return ret;
+        const type = args && args[0];
+        const props = ret.props || (args && args[1]) || null;
+        const name = typeName(type);
+        if (!state.debug && !NAME_HINT.test(name) && !(props && typeof props.renderReactions === "function")) return ret;
+        return wrap(args, ret);
+      } catch (_) { return ret; }
+    };    let patched = 0;
+    if (runtime) {
+      try { unpatches.push(patcher.after("jsx", runtime, wrap)); patched++; } catch (_) {}
+      if (typeof runtime.jsxs === "function") { try { unpatches.push(patcher.after("jsxs", runtime, wrap)); patched++; } catch (_) {} }
+    }
+    if (React && typeof React.createElement === "function") {
+      try { unpatches.push(patcher.after("createElement", React, createElementWrap)); patched++; } catch (_) {}
+    }
+    if (!patched) return false;
+    recordDebug("Reaction row hooks installed on " + (runtime ? "jsx/jsxs" : "React.createElement") + " and React.createElement; targeting EmojiReactionRowButton");
     return true;
   }
-
   /* ---- settings ---- */
   function Settings() {
     rainStore.useStore();
@@ -484,7 +566,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    recordDebug("BUILD v1.0.3 active; static avatars and keyed reaction updates enabled" );
+    recordDebug("BUILD v1.0.4 active; static avatars target always-visible reaction rows" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
