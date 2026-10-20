@@ -11,7 +11,7 @@ const implementation = (() => {
   const { findByProps, findByStoreName } = metro;
   const { React, ReactNative: RN, FluxDispatcher } = metro.common;
 
-  const BUILD = "v1.0.1";
+  const BUILD = "v1.0.2";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton|MessageReactions)$/;
@@ -37,7 +37,10 @@ const implementation = (() => {
   function recordDebug(line) {
     const value = String(line || "");
     if (!debugSeen.has(value)) {
-      if (debugSeen.size >= DEBUG_MAX) debugSeen.delete(debugSeen.keys().next().value);
+      if (debugSeen.size >= DEBUG_MAX) {
+        const evict = Array.from(debugSeen.keys()).find((key) => !key.startsWith("BUILD "));
+        if (evict !== undefined) debugSeen.delete(evict);
+      }
       debugSeen.set(value, Date.now());
       if (debugNotifyTimer == null) debugNotifyTimer = setTimeout(() => {
         debugNotifyTimer = null;
@@ -445,6 +448,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
+    recordDebug("BUILD v1.0.2 active; MessageReactions capture enabled" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
