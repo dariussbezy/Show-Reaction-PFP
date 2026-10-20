@@ -20,7 +20,7 @@ const implementation = (() => {
   const unpatches = [];
   const subs = new Set();
   const cache = new Map();
-  const debugSeen = new Set();
+  const debugSeen = new Map();
   let UserStore = null;
   let SelectedChannelStore = null;
   let RestAPI = null;
@@ -307,7 +307,6 @@ const implementation = (() => {
     const emoji = props.emoji || (props.reaction && props.reaction.emoji) || null;
     const messageId = props.messageId || (msg && msg.id) || null;
     if (!emoji || !messageId) return null;
-    if (!NAME_HINT.test(name) && !props.reaction) return null;
     let channelId = props.channelId || (msg && (msg.channel_id || msg.channelId)) || null;
     if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
     if (!channelId) return null;
@@ -326,8 +325,12 @@ const implementation = (() => {
         const type = args && args[0];
         const props = ret.props || (args && args[1]) || null;
         if (st.debug) {
-          const nm = typeName(type);
-          if (/reaction/i.test(nm) && !debugSeen.has(nm)) { debugSeen.add(nm); toast(nm + ": " + Object.keys(props || {}).slice(0, 12).join(", ")); }
+          const nm = typeName(type) || "(anonymous)";
+          const keys = Object.keys(props || {});
+          if ((/reaction|emoji/i.test(nm) || (props && (props.emoji || props.reaction || props.reactions))) && debugSeen.size < 40) {
+            const id = nm + ": " + keys.slice(0, 16).join(", ");
+            if (!debugSeen.has(id)) debugSeen.set(id, 1);
+          }
         }
         const r = resolve(type, props);
         if (!r) return ret;
@@ -361,7 +364,7 @@ const implementation = (() => {
       ["How many pictures", "Choose 1, 2 or 3 under Appearance. Messages with many reactions load one small request per reaction, so big channels can take a second to fill in."],
       ["Live updates", "When someone adds or removes a reaction, the pictures for that reaction reload by themselves."],
       ["Your own picture", "Turn on Hide my own avatar if you only want to see other people. Your avatar is skipped and the next person takes its place."],
-      ["Nothing shows up?", "Open a message that has reactions, then turn on Debug toast and reopen the chat. It shows the name and fields of the reaction component, so it can be matched exactly."],
+      ["Nothing shows up?", "Turn on Debug log, open a chat with reactions and scroll a little, then come back here. The log lists the reaction components found, so the plugin can be matched exactly."],
     ] });
     return h(RN.ScrollView, { style: { flex: 1 }, keyboardShouldPersistTaps: "handled", contentContainerStyle: { padding: 16, paddingBottom: 42 } },
       h(KitHero, { key: "hero", icon: "chat", title: "Show Reaction PFP", subtitle: "See who reacted, right next to the reaction", stats: [["Max avatars", String(s.maxAvatars || 3)], ["Cached", String(cache.size)]] }),
@@ -373,7 +376,12 @@ const implementation = (() => {
         chips("maxAvatars", "Max avatars", "How many pictures to show per reaction.", "chat", [[1, "1"], [2, "2"], [3, "3"]]),
         chips("size", "Avatar size", "Size of each picture.", "paint", [["small", "Small"], ["medium", "Medium"], ["large", "Large"]], true)),
       h(CustomSection, { key: "tools", title: "Troubleshooting" },
-        toggle("debug", "Debug toast", "Show the name and fields of reaction components once, to help fix matching.", "test", true)),
+        toggle("debug", "Debug log", "List the reaction components found in chat, to help fix matching.", "test", true)),
+      s.debug ? h(CustomSection, { key: "dbg", title: "Debug log", footer: "Open a chat with reactions, scroll a bit, come back here and screenshot this list." },
+        h(RN.View, { style: { padding: 16 } },
+          h(RN.Text, { selectable: true, style: { color: C.text, fontSize: 13, lineHeight: 19 } }, debugSeen.size ? Array.from(debugSeen.keys()).join("\n") : "Nothing captured yet."),
+          h(CustomAction, { title: "Refresh", compact: true, secondary: true, top: 12, onPress: () => bump((x) => x + 1) }),
+          h(CustomAction, { title: "Clear", compact: true, secondary: true, top: 8, onPress: () => { debugSeen.clear(); bump((x) => x + 1); } }))) : null,
       guide,
       h(RN.Text, { style: { color: C.sub, fontSize: 12, textAlign: "center", marginTop: 1, opacity: 0.7 } }, "Show Reaction PFP " + BUILD));
   }
