@@ -14,13 +14,16 @@ const implementation = (() => {
   const BUILD = "v1.0.0";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
-  const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill)$/;
+  const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton)$/;
   const SIZES = { small: 14, medium: 18, large: 22 };
 
   const unpatches = [];
   const subs = new Set();
   const cache = new Map();
   const debugSeen = new Map();
+  const debugSubs = new Set();
+  const DEBUG_MAX = 100;
+  let debugNotifyTimer = null;
   let UserStore = null;
   let SelectedChannelStore = null;
   let RestAPI = null;
@@ -31,6 +34,33 @@ const implementation = (() => {
   const cfg = () => rainStore.useStore.getState();
   const setSetting = (key, value) => rainStore.useStore.getState().updateSettings({ [key]: value });
   const toast = (t) => { try { ui.toasts.showToast(t); } catch (_) {} };
+  function recordDebug(line) {
+    const value = String(line || "");
+    if (!debugSeen.has(value)) {
+      if (debugSeen.size >= DEBUG_MAX) debugSeen.delete(debugSeen.keys().next().value);
+      debugSeen.set(value, Date.now());
+      if (debugNotifyTimer == null) debugNotifyTimer = setTimeout(() => {
+        debugNotifyTimer = null;
+        for (const fn of Array.from(debugSubs)) { try { fn(); } catch (_) {} }
+      }, 180);
+    }
+  }
+  function shapeOf(value) {
+    if (!value || typeof value !== "object") return typeof value;
+    if (Array.isArray(value)) {
+      const first = value[0];
+      return "Array(" + value.length + ")" + (first && typeof first === "object" ? "{" + Object.keys(first).slice(0, 8).join(",") + "}" : "");
+    }
+    return "{" + Object.keys(value).slice(0, 10).join(",") + (Object.keys(value).length > 10 ? ",…" : "") + "}";
+  }
+  function captureComponent(type, props) {
+    if (!props || (typeof type !== "function" && typeof type !== "object")) return;
+    const name = typeName(type) || "(anonymous component)";
+    const keys = Object.keys(props);
+    const nested = ["reaction", "emoji", "message", "item", "data", "reactionData"].filter((k) => props[k] != null).map((k) => k + "=" + shapeOf(props[k]));
+    const relevant = /reaction|emoji/i.test(name) || keys.some((k) => /reaction|emoji|message|channel|count/i.test(k)) || nested.length > 0;
+    if (relevant) recordDebug(name + " | props: " + keys.slice(0, 16).join(", ") + (nested.length ? " | nested: " + nested.join("; ") : ""));
+  }
   const myId = () => { try { return UserStore && UserStore.getCurrentUser() && UserStore.getCurrentUser().id || null; } catch (_) { return null; } };
 
 /* ---- shared settings design kit (same as the other plugins) ---- */
@@ -236,17 +266,24 @@ const implementation = (() => {
     const fresh = hit && (hit.loading || (Date.now() - hit.at < TTL && hit.count === count));
     if (fresh) return;
     const param = emojiParam(emoji);
-    if (!param || !RestAPI) return;
+    if (!param || !RestAPI) {
+      if (cfg().debug) recordDebug("FETCH skipped: " + (!param ? "emoji could not be encoded" : "Discord REST module missing"));
+      return;
+    }
     const entry = { users: hit ? hit.users : [], at: Date.now(), count, loading: true };
     cache.set(key, entry);
+    if (cfg().debug) recordDebug("FETCH started for reaction " + param);
     Promise.resolve(RestAPI.get({
       url: "/channels/" + channelId + "/messages/" + messageId + "/reactions/" + encodeURIComponent(param),
       query: { limit: FETCH_LIMIT, type: 0 },
       oldFormErrors: true
     })).then((res) => {
-      const body = res && res.body;
+      const body = Array.isArray(res) ? res : res && res.body;
       entry.users = Array.isArray(body) ? body.map((u) => ({ id: String(u.id), avatar: u.avatar || null, name: u.global_name || u.username || "" })) : [];
-    }).catch(() => {}).then(() => {
+      if (cfg().debug) recordDebug("FETCH succeeded: " + entry.users.length + " users returned" + (!Array.isArray(body) ? " (unexpected response shape)" : ""));
+    }).catch((err) => {
+      if (cfg().debug) recordDebug("FETCH failed: " + String(err && (err.message || err.status || err) || "unknown error").slice(0, 180));
+    }).then(() => {
       entry.loading = false;
       entry.at = Date.now();
       notify();
@@ -302,15 +339,31 @@ const implementation = (() => {
   function resolve(type, props) {
     if (!props) return null;
     const name = typeName(type);
-    if (/reactions$/i.test(name) || /reactionemoji|reactioncount|reactionbutton/i.test(name)) return null;
+    const candidate = /reaction|emoji/i.test(name) || !!(props.reaction || props.emoji || props.reactions);
+    if (/^(MessageReactions|MessageReactionsContent)$/i.test(name) || /reactionemoji|reactioncount/i.test(name)) {
+      if (cfg().debug && candidate) recordDebug("SKIP " + name + ": container/child component");
+      return null;
+    }
     const msg = props.message || null;
-    const emoji = props.emoji || (props.reaction && props.reaction.emoji) || null;
-    const messageId = props.messageId || (msg && msg.id) || null;
-    if (!emoji || !messageId) return null;
-    let channelId = props.channelId || (msg && (msg.channel_id || msg.channelId)) || null;
+    const reaction = props.reaction || (props.item && (props.item.reaction || props.item)) || null;
+    const emoji = props.emoji || (reaction && reaction.emoji) || null;
+    const messageId = props.messageId || (msg && msg.id) || props.message_id || null;
+    if (!emoji || !messageId) {
+      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + (name || "component") + ": emoji=" + !!emoji + ", messageId=" + !!messageId + ", keys=" + Object.keys(props).slice(0, 16).join(","));
+      return null;
+    }
+    if (!NAME_HINT.test(name) && !reaction) {
+      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + name + ": component name/props did not match per-reaction row");
+      return null;
+    }
+    let channelId = props.channelId || (msg && (msg.channel_id || msg.channelId)) || props.channel_id || null;
     if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
-    if (!channelId) return null;
-    const count = props.count != null ? props.count : (props.reaction && props.reaction.count != null ? props.reaction.count : 0);
+    if (!channelId) {
+      if (cfg().debug && candidate) recordDebug("UNRESOLVED " + name + ": channelId missing");
+      return null;
+    }
+    const count = props.count != null ? props.count : (reaction && reaction.count != null ? reaction.count : 0);
+    if (cfg().debug) recordDebug("MATCHED " + name + ": message, channel and emoji found");
     return { channelId: String(channelId), messageId: String(messageId), emoji, count };
   }
   function patchReactions() {
@@ -325,12 +378,8 @@ const implementation = (() => {
         const type = args && args[0];
         const props = ret.props || (args && args[1]) || null;
         if (st.debug) {
-          const nm = typeName(type) || "(anonymous)";
-          const keys = Object.keys(props || {});
-          if ((/reaction|emoji/i.test(nm) || (props && (props.emoji || props.reaction || props.reactions))) && debugSeen.size < 40) {
-            const id = nm + ": " + keys.slice(0, 16).join(", ");
-            if (!debugSeen.has(id)) debugSeen.set(id, 1);
-          }
+          if (!debugSeen.has("JSX hook active")) recordDebug("JSX hook active; rendering intercepted elements");
+          captureComponent(type, props);
         }
         const r = resolve(type, props);
         if (!r) return ret;
@@ -342,6 +391,7 @@ const implementation = (() => {
     };
     unpatches.push(patcher.after("jsx", runtime, wrap));
     if (typeof runtime.jsxs === "function") unpatches.push(patcher.after("jsxs", runtime, wrap));
+    recordDebug("JSX hook installed" + (typeof runtime.jsxs === "function" ? " (jsx + jsxs)" : " (jsx only)") + "; open a chat with reactions to capture components");
     return true;
   }
 
@@ -349,6 +399,11 @@ const implementation = (() => {
   function Settings() {
     rainStore.useStore();
     const [, bump] = React.useState(0);
+    React.useEffect(() => {
+      const fn = () => bump((x) => x + 1);
+      debugSubs.add(fn);
+      return () => { debugSubs.delete(fn); };
+    }, []);
     const C = palette(), h = React.createElement;
     const s = cfg();
     const refresh = () => { cache.clear(); notify(); bump((x) => x + 1); };
@@ -364,7 +419,7 @@ const implementation = (() => {
       ["How many pictures", "Choose 1, 2 or 3 under Appearance. Messages with many reactions load one small request per reaction, so big channels can take a second to fill in."],
       ["Live updates", "When someone adds or removes a reaction, the pictures for that reaction reload by themselves."],
       ["Your own picture", "Turn on Hide my own avatar if you only want to see other people. Your avatar is skipped and the next person takes its place."],
-      ["Nothing shows up?", "Turn on Debug log, open a chat with reactions and scroll a little, then come back here. The log lists the reaction components found, so the plugin can be matched exactly."],
+      ["Nothing shows up?", "Turn on Debug capture, open a chat with reactions, then check the diagnostic log below."],
     ] });
     return h(RN.ScrollView, { style: { flex: 1 }, keyboardShouldPersistTaps: "handled", contentContainerStyle: { padding: 16, paddingBottom: 42 } },
       h(KitHero, { key: "hero", icon: "chat", title: "Show Reaction PFP", subtitle: "See who reacted, right next to the reaction", stats: [["Max avatars", String(s.maxAvatars || 3)], ["Cached", String(cache.size)]] }),
@@ -376,12 +431,11 @@ const implementation = (() => {
         chips("maxAvatars", "Max avatars", "How many pictures to show per reaction.", "chat", [[1, "1"], [2, "2"], [3, "3"]]),
         chips("size", "Avatar size", "Size of each picture.", "paint", [["small", "Small"], ["medium", "Medium"], ["large", "Large"]], true)),
       h(CustomSection, { key: "tools", title: "Troubleshooting" },
-        toggle("debug", "Debug log", "List the reaction components found in chat, to help fix matching.", "test", true)),
-      s.debug ? h(CustomSection, { key: "dbg", title: "Debug log", footer: "Open a chat with reactions, scroll a bit, come back here and screenshot this list." },
+        toggle("debug", "Debug capture", "Record reaction component props and request results.", "test", true)),
+      h(CustomSection, { key: "dbg", title: "Diagnostic log", footer: "Enable Debug capture, open a chat with reactions, then return here. The log is kept until cleared or the plugin reloads." },
         h(RN.View, { style: { padding: 16 } },
-          h(RN.Text, { selectable: true, style: { color: C.text, fontSize: 13, lineHeight: 19 } }, debugSeen.size ? Array.from(debugSeen.keys()).join("\n") : "Nothing captured yet."),
-          h(CustomAction, { title: "Refresh", compact: true, secondary: true, top: 12, onPress: () => bump((x) => x + 1) }),
-          h(CustomAction, { title: "Clear", compact: true, secondary: true, top: 8, onPress: () => { debugSeen.clear(); bump((x) => x + 1); } }))) : null,
+          h(RN.Text, { selectable: true, style: { color: C.text, fontSize: 12, lineHeight: 18 } }, debugSeen.size ? Array.from(debugSeen.keys()).join("\n") : "Waiting for plugin startup or a matching component…"),
+          h(CustomAction, { title: "Clear log", compact: true, secondary: true, top: 12, onPress: () => { debugSeen.clear(); bump((x) => x + 1); } }))),
       guide,
       h(RN.Text, { style: { color: C.sub, fontSize: 12, textAlign: "center", marginTop: 1, opacity: 0.7 } }, "Show Reaction PFP " + BUILD));
   }
@@ -398,9 +452,10 @@ const implementation = (() => {
     try { UserStore = findByStoreName("UserStore"); } catch (_) {}
     try { SelectedChannelStore = findByStoreName("SelectedChannelStore"); } catch (_) {}
     try { RestAPI = findByProps("getAPIBaseURL", "get"); } catch (_) {}
-    if (!RestAPI) { toast("Show Reaction PFP: Discord request module not found"); return; }
-    if (!patchReactions()) { toast("Show Reaction PFP: could not hook reactions"); return; }
-    if (FluxDispatcher) { try { unpatches.push(patcher.before("dispatch", FluxDispatcher, hookDispatch)); } catch (_) {} }
+    if (!RestAPI) { recordDebug("STARTUP failed: Discord REST module not found"); toast("Show Reaction PFP: Discord request module not found"); return; }
+    recordDebug("STARTUP: Discord REST module found");
+    if (!patchReactions()) { recordDebug("STARTUP failed: JSX runtime not found"); toast("Show Reaction PFP: could not hook reactions"); return; }
+    if (FluxDispatcher) { try { unpatches.push(patcher.before("dispatch", FluxDispatcher, hookDispatch)); recordDebug("STARTUP: reaction event listener attached"); } catch (_) { recordDebug("STARTUP: reaction event listener failed"); } }
   }
 
   function onLoad() {
@@ -425,6 +480,8 @@ const implementation = (() => {
     subs.clear();
     cache.clear();
     debugSeen.clear();
+    debugSubs.clear();
+    if (debugNotifyTimer != null) { clearTimeout(debugNotifyTimer); debugNotifyTimer = null; }
     UserStore = null; SelectedChannelStore = null; RestAPI = null;
   }
 
