@@ -8,12 +8,12 @@ const implementation = (() => {
   const { metro } = rainRuntime;
   const patcher = rainRuntime.api.patcher;
   const ui = rainRuntime.api.ui;
-  const { findByProps, findByStoreName } = metro;
+  const { findByProps, findByStoreName, findByFilePath } = metro;
   const { React, ReactNative: RN, FluxDispatcher } = metro.common;
   const ReactionContext = React.createContext(null);
   const reactionRenderers = new WeakMap();
 
-  const BUILD = "v1.0.4";
+  const BUILD = "v1.0.5";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^EmojiReactionRowButton$/;
@@ -24,7 +24,12 @@ const implementation = (() => {
   const cache = new Map();
   const debugSeen = new Map();
   const debugSubs = new Set();
-  const DEBUG_MAX = 100;
+  const DEBUG_MAX = 240;
+  const REACTION_BUTTON_FILE = "modules/reactions/native/EmojiReactionRowButton.tsx";
+  const reactionButtonTypes = new Set();
+  let reactionButtonLookupDone = false;
+  let reactionButtonLookupBusy = false;
+  let lastReactionButtonLookupAt = 0;
   let debugNotifyTimer = null;
   let UserStore = null;
   let SelectedChannelStore = null;
@@ -40,8 +45,14 @@ const implementation = (() => {
     const value = String(line || "");
     if (!debugSeen.has(value)) {
       if (debugSeen.size >= DEBUG_MAX) {
-        const evict = Array.from(debugSeen.keys()).find((key) => !key.startsWith("BUILD "));
+        const isImportant = (key) => /^(BUILD |STARTUP |MODULE |REACTION |TARGET |FETCH (started|succeeded|failed|skipped)|ROW )/.test(key);
+        const evict = Array.from(debugSeen.keys()).find((key) => !isImportant(key));
         if (evict !== undefined) debugSeen.delete(evict);
+        else if (!isImportant(value)) return;
+        else {
+          const oldest = Array.from(debugSeen.keys()).find((key) => !key.startsWith("BUILD "));
+          if (oldest !== undefined) debugSeen.delete(oldest);
+        }
       }
       debugSeen.set(value, Date.now());
       if (debugNotifyTimer == null) debugNotifyTimer = setTimeout(() => {
@@ -64,7 +75,9 @@ const implementation = (() => {
     const keys = Object.keys(props);
     const nested = ["reaction", "emoji", "message", "item", "data", "reactionData"].filter((k) => props[k] != null).map((k) => k + "=" + shapeOf(props[k]));
     const relevant = /reaction|emoji/i.test(name) || keys.some((k) => /reaction|emoji|message|channel|count/i.test(k)) || nested.length > 0;
-    if (relevant) recordDebug(name + " | props: " + keys.slice(0, 16).join(", ") + (nested.length ? " | nested: " + nested.join("; ") : ""));
+    const callback = props.renderReactions != null ? " | renderReactions=" + typeof props.renderReactions : "";
+    const messageContext = (props.message != null || props.messageId != null || props.item != null) ? " | messageContextProps=yes" : "";
+    if (relevant || callback || messageContext) recordDebug(name + " | props: " + keys.slice(0, 16).join(", ") + (nested.length ? " | nested: " + nested.join("; ") : "") + callback + messageContext);
   }
   const myId = () => { try { return UserStore && UserStore.getCurrentUser() && UserStore.getCurrentUser().id || null; } catch (_) { return null; } };
 
@@ -419,6 +432,9 @@ const implementation = (() => {
       ensure(String(channelId), String(messageId), p.emoji, p.count);
       return undefined;
     }, [key, p.count, ver]);
+    React.useEffect(() => {
+      if (!key && cfg().debug) recordDebug("ROW rendered without message-object context; not fetching from the long-press sheet");
+    }, [key]);
     const s = cfg();
     const entry = key ? cache.get(key) : null;
     const me = myId();
@@ -428,7 +444,7 @@ const implementation = (() => {
     const size = SIZES[s.size] || SIZES.medium;
     const ring = ringColor();
     const step = s.overlap ? -Math.round(size * 0.32) : 3;
-    return h(RN.View, { pointerEvents: "box-none", style: { flexDirection: "row", alignItems: "center", alignSelf: "flex-start" } },
+    return h(RN.View, { pointerEvents: "box-none", style: { flexDirection: "row", alignItems: "center", flexShrink: 0, flexWrap: "nowrap" } },
       p.original,
       h(RN.View, { pointerEvents: "none", style: { flexDirection: "row", alignItems: "center", marginLeft: 5 } },
         ...users.map((u, i) => h(RN.Image, { key: "rp-" + u.id, source: { uri: avatarUrl(u, 64) }, accessibilityLabel: u.name,
@@ -439,11 +455,87 @@ const implementation = (() => {
     if (typeof t === "string") return t;
     return t.displayName || t.name || (t.type && (t.type.displayName || t.type.name)) || (t.render && (t.render.displayName || t.render.name)) || "";
   }
-  function resolve(type, props) {
+  function isComponentType(value) {
+    return typeof value === "function" || (!!value && typeof value === "object");
+  }
+  function addReactionButtonType(value, seen) {
+    if (!isComponentType(value) || seen.has(value)) return;
+    seen.add(value);
+    reactionButtonTypes.add(value);
+    try { if (value.type) addReactionButtonType(value.type, seen); } catch (_) {}
+    try { if (value.render) addReactionButtonType(value.render, seen); } catch (_) {}
+    try { if (value.default) addReactionButtonType(value.default, seen); } catch (_) {}
+  }
+  function registerReactionButtonTypes() {
+    const now = Date.now();
+    if (reactionButtonLookupDone || reactionButtonLookupBusy || now - lastReactionButtonLookupAt < 4000) return reactionButtonTypes.size > 0;
+    lastReactionButtonLookupAt = now;
+    reactionButtonLookupBusy = true;
+    try {
+      let exports = null;
+      const host = globalThis.window || globalThis;
+      const modules = host && host.modules;
+      const requireModule = host && host.__r;
+      if (modules && typeof requireModule === "function") {
+        for (const id of Object.keys(modules)) {
+          if (modules[id] && modules[id].__filePath === REACTION_BUTTON_FILE) {
+            exports = requireModule(Number(id));
+            break;
+          }
+        }
+      } else if (typeof findByFilePath === "function") {
+        exports = findByFilePath(REACTION_BUTTON_FILE);
+      }
+      if (exports) {
+        const keys = Object.keys(exports);
+        const seen = new Set();
+        for (const key of keys) addReactionButtonType(exports[key], seen);
+        if (typeof exports === "function" || exports.$$typeof) addReactionButtonType(exports, seen);
+        reactionButtonLookupDone = reactionButtonTypes.size > 0;
+        recordDebug("MODULE reaction row source found: " + REACTION_BUTTON_FILE + " | exports=" + keys.slice(0, 10).join(","));
+      } else {
+        recordDebug("MODULE reaction row source not indexed yet: " + REACTION_BUTTON_FILE);
+      }
+    } catch (err) {
+      recordDebug("MODULE reaction row lookup failed: " + String(err && (err.message || err) || "unknown error").slice(0, 120));
+    } finally {
+      reactionButtonLookupBusy = false;
+    }
+    return reactionButtonTypes.size > 0;
+  }
+  function hasReactionData(props) {
+    if (!props) return false;
+    const item = props.item || null;
+    const reaction = props.reaction || props.reactionData || (item && (item.reaction || item)) || null;
+    const emoji = props.emoji || props.reactionEmoji || (reaction && reaction.emoji) || (item && item.emoji) || null;
+    const count = props.count != null ? props.count : (reaction && reaction.count != null ? reaction.count : (item && item.count));
+    return !!emoji && count != null && (typeof props.onPress === "function" || typeof props.onLongPress === "function");
+  }
+  function isReactionButtonType(type, props) {
+    const name = typeName(type);
+    if (NAME_HINT.test(name)) return true;
+    if (reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render))) return true;
+    if (hasReactionData(props)) {
+      if (!reactionButtonLookupDone) registerReactionButtonTypes();
+      if (reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render))) return true;
+      if (cfg().debug) recordDebug("ROW candidate not source component: " + (name || "(anonymous)") + " | props=" + Object.keys(props).slice(0, 14).join(","));
+    }
+    return false;
+  }
+  function contextForElement(props) {
+    if (!props) return null;
+    const hasMessage = props.message != null || props.messageRecord != null ||
+      (props.record && (props.record.message != null || looksLikeMessage(props.record))) ||
+      (props.item && (props.item.message != null || looksLikeMessage(props.item)));
+    if (!hasMessage) return null;
+    const context = messageContextFrom([], props, null);
+    return context && context.messageId ? context : null;
+  }
+  function resolve(type, props, matched) {
     if (!props) return null;
     const name = typeName(type);
     const candidate = /reaction|emoji/i.test(name) || !!(props.reaction || props.emoji || props.reactions);
-    if (!NAME_HINT.test(name)) {
+    if (!matched) {
       if (cfg().debug && /^MessageReactions(Content)?$/i.test(name) && candidate) recordDebug("SKIP " + name + ": long-press reaction details UI");
       return null;
     }
@@ -474,10 +566,12 @@ const implementation = (() => {
         const props = ret.props || (args && args[1]) || null;
         const name = typeName(type);
         const hasReactionRenderer = !!(props && typeof props.renderReactions === "function");
-        if (!st.debug && !NAME_HINT.test(name) && !hasReactionRenderer) return ret;
+        const rowTarget = isReactionButtonType(type, props);
+        if (!st.debug && !rowTarget && !hasReactionRenderer && !(props && (props.message != null || props.item != null))) return ret;
         if (st.debug) {
           if (!debugSeen.has("JSX hook active")) recordDebug("JSX hook active; rendering intercepted elements");
           captureComponent(type, props);
+          if (hasReactionData(props)) recordDebug("ROW props captured: component=" + (name || "(anonymous)") + " | keys=" + Object.keys(props).slice(0, 16).join(","));
         }
         if (hasReactionRenderer) {
           const renderer = wrapReactionRenderer(props.renderReactions, props);
@@ -485,11 +579,15 @@ const implementation = (() => {
             return React.cloneElement(ret, { renderReactions: renderer });
           }
         }
-        const r = resolve(type, props);
-        if (!r) return ret;
-        const next = { original: ret, channelId: r.channelId, messageId: r.messageId, emoji: r.emoji, count: r.count };
-        if (ret.key != null) next.key = ret.key;
-        return React.createElement(Reactors, next);
+        const context = contextForElement(props);
+        const r = resolve(type, props, rowTarget);
+        if (r) {
+          const next = { original: ret, channelId: context && context.channelId, messageId: context && context.messageId, emoji: r.emoji, count: r.count };
+          if (ret.key != null) next.key = ret.key;
+          const wrappedRow = React.createElement(Reactors, next);
+          return context ? React.createElement(ReactionContext.Provider, { value: context }, wrappedRow) : wrappedRow;
+        }
+        return context ? React.createElement(ReactionContext.Provider, { value: context }, ret) : ret;
       } catch (_) {}
       return ret;
     };
@@ -501,7 +599,8 @@ const implementation = (() => {
         const type = args && args[0];
         const props = ret.props || (args && args[1]) || null;
         const name = typeName(type);
-        if (!state.debug && !NAME_HINT.test(name) && !(props && typeof props.renderReactions === "function")) return ret;
+        const knownRow = reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render));
+        if (!state.debug && !NAME_HINT.test(name) && !knownRow && !hasReactionData(props) && !(props && typeof props.renderReactions === "function") && !(props && (props.message != null || props.item != null))) return ret;
         return wrap(args, ret);
       } catch (_) { return ret; }
     };    let patched = 0;
@@ -566,7 +665,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    recordDebug("BUILD v1.0.4 active; static avatars target always-visible reaction rows" );
+    recordDebug("BUILD v1.0.5 active; reaction row matched by Discord module identity and message context inherited from message component" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
@@ -603,6 +702,7 @@ const implementation = (() => {
     cache.clear();
     debugSeen.clear();
     debugSubs.clear();
+    reactionButtonTypes.clear(); reactionButtonLookupDone = false; reactionButtonLookupBusy = false; lastReactionButtonLookupAt = 0;
     if (debugNotifyTimer != null) { clearTimeout(debugNotifyTimer); debugNotifyTimer = null; }
     UserStore = null; SelectedChannelStore = null; RestAPI = null;
   }
