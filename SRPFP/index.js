@@ -11,14 +11,14 @@ const implementation = (() => {
   const { findByProps, findByStoreName } = metro;
   const { React, ReactNative: RN, FluxDispatcher } = metro.common;
 
-  const BUILD = "v1.0.2";
+  const BUILD = "v1.0.3";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton|MessageReactions)$/;
   const SIZES = { small: 14, medium: 18, large: 22 };
 
   const unpatches = [];
-  const subs = new Set();
+  const subs = new Map();
   const cache = new Map();
   const debugSeen = new Map();
   const debugSubs = new Set();
@@ -256,9 +256,27 @@ const implementation = (() => {
     return emoji.name || null;
   }
   const keyOf = (c, m, e) => c + ":" + m + ":" + (emojiParam(e) || "");
-  function notify() { for (const fn of Array.from(subs)) { try { fn(); } catch (_) {} } }
+  function notify(key) {
+    const listeners = [];
+    if (key == null) {
+      for (const group of subs.values()) for (const fn of group) listeners.push(fn);
+    } else {
+      const group = subs.get(key);
+      if (group) for (const fn of group) listeners.push(fn);
+    }
+    for (const fn of listeners) { try { fn(); } catch (_) {} }
+  }
+  function subscribe(key, fn) {
+    let group = subs.get(key);
+    if (!group) { group = new Set(); subs.set(key, group); }
+    group.add(fn);
+    return () => {
+      group.delete(fn);
+      if (!group.size && subs.get(key) === group) subs.delete(key);
+    };
+  }
   function avatarUrl(u, size) {
-    if (u.avatar) return "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + "." + (String(u.avatar).indexOf("a_") === 0 ? "gif" : "png") + "?size=" + size;
+    if (u.avatar) return "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + ".png?size=" + size;
     let idx = 0;
     try { idx = Number(BigInt(u.id) >> BigInt(22)) % 6; } catch (_) {}
     return "https://cdn.discordapp.com/embed/avatars/" + idx + ".png";
@@ -289,12 +307,12 @@ const implementation = (() => {
     }).then(() => {
       entry.loading = false;
       entry.at = Date.now();
-      notify();
+      notify(key);
     });
   }
   function invalidate(channelId, messageId, emoji) {
     const key = keyOf(channelId, messageId, emoji);
-    if (cache.has(key)) { cache.delete(key); notify(); }
+    if (cache.has(key)) { cache.delete(key); notify(key); }
   }
   function hookDispatch(args) {
     try {
@@ -312,15 +330,15 @@ const implementation = (() => {
   }
   function Reactors(p) {
     const h = React.createElement;
+    const key = keyOf(p.channelId, p.messageId, p.emoji);
     const [ver, bump] = React.useState(0);
     React.useEffect(() => {
       const fn = () => bump((x) => x + 1);
-      subs.add(fn);
-      return () => { subs.delete(fn); };
-    }, []);
-    React.useEffect(() => { ensure(p.channelId, p.messageId, p.emoji, p.count); }, [p.channelId, p.messageId, p.count, ver]);
+      return subscribe(key, fn);
+    }, [key]);
+    React.useEffect(() => { ensure(p.channelId, p.messageId, p.emoji, p.count); }, [key, p.count, ver]);
     const s = cfg();
-    const entry = cache.get(keyOf(p.channelId, p.messageId, p.emoji));
+    const entry = cache.get(key);
     const me = myId();
     const max = Math.max(1, Math.min(3, Number(s.maxAvatars) || 3));
     const users = ((entry && entry.users) || []).filter((u) => !(s.hideSelf && me && u.id === me)).slice(0, max);
@@ -328,7 +346,7 @@ const implementation = (() => {
     const size = SIZES[s.size] || SIZES.medium;
     const ring = ringColor();
     const step = s.overlap ? -Math.round(size * 0.32) : 3;
-    return h(RN.View, { style: { flexDirection: "row", alignItems: "center", flexShrink: 0 } },
+    return h(React.Fragment, null,
       p.original,
       h(RN.View, { pointerEvents: "none", style: { flexDirection: "row", alignItems: "center", marginLeft: 5 } },
         ...users.map((u, i) => h(RN.Image, { key: "rp-" + u.id, source: { uri: avatarUrl(u, 64) }, accessibilityLabel: u.name,
@@ -369,6 +387,23 @@ const implementation = (() => {
     if (cfg().debug) recordDebug("MATCHED " + name + ": message, channel and emoji found");
     return { channelId: String(channelId), messageId: String(messageId), emoji, count };
   }
+  function scheduleReactionPrefetch(props) {
+    if (!props || !Array.isArray(props.reactions) || !props.reactions.length || !props.messageId) return;
+    let channelId = props.channelId || props.channel_id || null;
+    if (!channelId) { try { channelId = SelectedChannelStore && SelectedChannelStore.getChannelId(); } catch (_) {} }
+    if (!channelId) return;
+    const messageId = String(props.messageId);
+    const pending = props.reactions.map((reaction) => ({
+      emoji: reaction && (reaction.emoji || (reaction.reaction && reaction.reaction.emoji)),
+      count: reaction && reaction.count != null ? reaction.count : 0
+    })).filter((reaction) => reaction.emoji && reaction.count > 0);
+    if (!pending.length) return;
+    if (cfg().debug) recordDebug("PREFETCH MessageReactionsContent: " + pending.length + " reactions");
+    Promise.resolve().then(() => {
+      if (!loadRequested || !cfg().enabled) return;
+      for (const reaction of pending) ensure(String(channelId), messageId, reaction.emoji, reaction.count);
+    });
+  }
   function patchReactions() {
     let runtime = null;
     try { const r = findByProps("jsx", "jsxs"); if (r && typeof r.jsx === "function") runtime = r; } catch (_) {}
@@ -384,6 +419,7 @@ const implementation = (() => {
           if (!debugSeen.has("JSX hook active")) recordDebug("JSX hook active; rendering intercepted elements");
           captureComponent(type, props);
         }
+        if (/^MessageReactionsContent$/i.test(typeName(type))) { scheduleReactionPrefetch(props); return ret; }
         const r = resolve(type, props);
         if (!r) return ret;
         const next = { original: ret, channelId: r.channelId, messageId: r.messageId, emoji: r.emoji, count: r.count };
@@ -448,7 +484,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    recordDebug("BUILD v1.0.2 active; MessageReactions capture enabled" );
+    recordDebug("BUILD v1.0.3 active; static avatars and keyed reaction updates enabled" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
