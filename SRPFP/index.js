@@ -14,7 +14,7 @@ const implementation = (() => {
   const BUILD = "v1.0.0";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
-  const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton)$/;
+  const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton|MessageReactions)$/;
   const SIZES = { small: 14, medium: 18, large: 22 };
 
   const unpatches = [];
@@ -340,7 +340,7 @@ const implementation = (() => {
     if (!props) return null;
     const name = typeName(type);
     const candidate = /reaction|emoji/i.test(name) || !!(props.reaction || props.emoji || props.reactions);
-    if (/^(MessageReactions|MessageReactionsContent)$/i.test(name) || /reactionemoji|reactioncount/i.test(name)) {
+    if (/^MessageReactionsContent$/i.test(name) || /reactionemoji|reactioncount/i.test(name)) {
       if (cfg().debug && candidate) recordDebug("SKIP " + name + ": container/child component");
       return null;
     }
