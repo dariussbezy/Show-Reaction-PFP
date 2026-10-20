@@ -11,7 +11,7 @@ const implementation = (() => {
   const { findByProps, findByStoreName } = metro;
   const { React, ReactNative: RN, FluxDispatcher } = metro.common;
 
-  const BUILD = "v1.0.0";
+  const BUILD = "v1.0.1";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^(Reaction|MessageReaction|MessageReactionPill|ReactionPill|EmojiReactionRowButton|MessageReactions)$/;
