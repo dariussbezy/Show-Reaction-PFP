@@ -13,7 +13,7 @@ const implementation = (() => {
   const ReactionContext = React.createContext(null);
   const reactionRenderers = new WeakMap();
 
-  const BUILD = "v1.0.6";
+  const BUILD = "v1.0.7";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^EmojiReactionRowButton$/;
@@ -604,7 +604,10 @@ const implementation = (() => {
         const type = args && args[0];
         const props = ret.props || (args && args[1]) || null;
         const name = typeName(type);
-        const knownRow = reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render));
+        // React.createElement can be the route used for the message reaction
+        // row. Resolve its source identity before the candidate-props gate, or
+        // anonymous Discord builds are skipped before we ever inspect them.
+        const knownRow = isReactionButtonType(type, props);
         if (!state.debug && !NAME_HINT.test(name) && !knownRow && !hasReactionData(props) && !(props && typeof props.renderReactions === "function") && !(props && (props.message != null || props.item != null))) return ret;
         return wrap(args, ret);
       } catch (_) { return ret; }
@@ -670,7 +673,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    recordDebug("BUILD v1.0.6 active; reaction row matched by Discord module identity and message context inherited from message component" );
+    recordDebug("BUILD v1.0.7 active; reaction row matched by Discord module identity and message context inherited from message component" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];

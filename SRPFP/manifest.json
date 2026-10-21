@@ -2,7 +2,7 @@
   "id": "showreactionpfp",
   "name": "Show Reaction PFP",
   "description": "Shows up to 3 profile pictures of the people who reacted, right next to each reaction. Check the plugin settings!",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "authors": [
     "dariussbezy"
   ],
