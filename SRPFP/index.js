@@ -13,7 +13,7 @@ const implementation = (() => {
   const ReactionContext = React.createContext(null);
   const reactionRenderers = new WeakMap();
 
-  const BUILD = "v1.0.5";
+  const BUILD = "v1.0.6";
   const TTL = 90000;
   const FETCH_LIMIT = 6;
   const NAME_HINT = /^EmojiReactionRowButton$/;
@@ -478,13 +478,14 @@ const implementation = (() => {
       const requireModule = host && host.__r;
       if (modules && typeof requireModule === "function") {
         for (const id of Object.keys(modules)) {
-          if (modules[id] && modules[id].__filePath === REACTION_BUTTON_FILE) {
+          if (modules[id] && String(modules[id].__filePath || "").endsWith(REACTION_BUTTON_FILE)) {
             exports = requireModule(Number(id));
+            recordDebug("MODULE reaction row module id found: " + id);
             break;
           }
         }
-      } else if (typeof findByFilePath === "function") {
-        exports = findByFilePath(REACTION_BUTTON_FILE);
+      } else {
+        recordDebug("MODULE reaction row lookup unavailable: Metro module map missing");
       }
       if (exports) {
         const keys = Object.keys(exports);
@@ -515,19 +516,20 @@ const implementation = (() => {
     const name = typeName(type);
     if (NAME_HINT.test(name)) return true;
     if (reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render))) return true;
-    if (hasReactionData(props)) {
-      if (!reactionButtonLookupDone) registerReactionButtonTypes();
-      if (reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render))) return true;
-      if (cfg().debug) recordDebug("ROW candidate not source component: " + (name || "(anonymous)") + " | props=" + Object.keys(props).slice(0, 14).join(","));
-    }
+    // Find the exact Discord component before filtering by props. The row's
+    // props differ across Discord builds, so requiring a particular shape here
+    // made the lookup unreachable on some builds.
+    if (!reactionButtonLookupDone) registerReactionButtonTypes();
+    if (reactionButtonTypes.has(type) || (type && reactionButtonTypes.has(type.type)) || (type && reactionButtonTypes.has(type.render))) return true;
+    if (cfg().debug && hasReactionData(props)) recordDebug("ROW candidate not source component: " + (name || "(anonymous)") + " | props=" + Object.keys(props).slice(0, 14).join(","));
     return false;
   }
-  function contextForElement(props) {
+  function contextForElement(props, allowExplicitIds) {
     if (!props) return null;
     const hasMessage = props.message != null || props.messageRecord != null ||
       (props.record && (props.record.message != null || looksLikeMessage(props.record))) ||
       (props.item && (props.item.message != null || looksLikeMessage(props.item)));
-    if (!hasMessage) return null;
+    if (!hasMessage && !(allowExplicitIds && (props.messageId != null || props.message_id != null))) return null;
     const context = messageContextFrom([], props, null);
     return context && context.messageId ? context : null;
   }
@@ -579,7 +581,10 @@ const implementation = (() => {
             return React.cloneElement(ret, { renderReactions: renderer });
           }
         }
-        const context = contextForElement(props);
+        // The source-identified button belongs to the static message reaction
+        // row. Its message id is sufficient context even when Discord does not
+        // pass the whole message object through to the button.
+        const context = contextForElement(props, rowTarget);
         const r = resolve(type, props, rowTarget);
         if (r) {
           const next = { original: ret, channelId: context && context.channelId, messageId: context && context.messageId, emoji: r.emoji, count: r.count };
@@ -665,7 +670,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    recordDebug("BUILD v1.0.5 active; reaction row matched by Discord module identity and message context inherited from message component" );
+    recordDebug("BUILD v1.0.6 active; reaction row matched by Discord module identity and message context inherited from message component" );
     const defaults = { enabled: true, hideSelf: false, overlap: true, maxAvatars: 3, size: "medium", debug: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
