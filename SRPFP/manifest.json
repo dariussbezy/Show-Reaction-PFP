@@ -1,8 +1,8 @@
 {
-  "id": "showreactionpfp",
-  "name": "Show Reaction PFP",
-  "description": "Shows up to 3 profile pictures of the people who reacted, right next to each reaction. Check the plugin settings!",
-  "version": "1.0.7",
+  "id": "quicktranslate",
+  "name": "Quick Translate",
+  "description": "Translate incoming and outgoing messages, use auto-translate, and do more with Google Translate or DeepL. Check the plugin settings!",
+  "version": "1.0.8",
   "authors": [
     "dariussbezy"
   ],
